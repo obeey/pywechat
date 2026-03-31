@@ -175,8 +175,8 @@ def send_demo(friend: str, message: str) -> None:
     main_window = open_chat(friend)
     payload = [
         message,
-        f"sent at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        "this is a minimal automation demo message.",
+        # f"sent at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        # "this is a minimal automation demo message.",
     ]
     for item in payload:
         send_one(main_window, item)
