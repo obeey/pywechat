@@ -52,10 +52,10 @@ REALTIME_PATTERNS = [
     r"伊朗",
     r"中国",
     r"美国",
+    r"多少",
 ]
 
 BROWSER_SESSION = "wechat-research"
-CDP_URL = "http://127.0.0.1:9222"
 BROWSER_USE_EXE = os.getenv("BROWSER_USE_EXE", r"C:\Users\Nico\.browser-use-env\Scripts\browser-use.exe")
 BROWSER_PROFILE = os.getenv("BROWSER_USE_PROFILE", "Default")
 BROWSER_USE_HOME_DIR = ".browser-use-home5"
@@ -65,6 +65,7 @@ SELF_MENTION_ALIASES = {
     for alias in os.getenv("WECHAT_SELF_ALIASES", "Nico,尼科,我").split(",")
     if alias.strip()
 }
+CHAT_CONTEXT_LIMIT = int(os.getenv("WECHAT_CONTEXT_LIMIT", "8"))
 
 
 def configure():
@@ -252,6 +253,60 @@ def get_last_message(main_window):
     return None
 
 
+def get_recent_chat_context(main_window, limit=8):
+    try:
+        input_field = main_window.child_window(auto_id="chat_input_field", control_type="Edit")
+        input_top = input_field.rectangle().top
+    except Exception:
+        main_rect = main_window.rectangle()
+        input_top = main_rect.bottom * 0.8
+
+    main_rect = main_window.rectangle()
+    chat_area_left = main_rect.left + main_rect.width() * 0.3
+    entries = []
+    forbidden_keywords = ["撤回", " transferred", "发送了", "Voice input", "Hold Ctrl", "Ctrl+Win"]
+
+    for desc in main_window.descendants():
+        try:
+            text = (desc.window_text() or "").strip()
+            if not text:
+                continue
+            rect = desc.rectangle()
+            if rect.left <= chat_area_left or rect.bottom >= input_top:
+                continue
+            if any(kw in text for kw in forbidden_keywords):
+                continue
+            if len(text) > 300:
+                continue
+            is_right_aligned = rect.left > (main_rect.left + main_rect.width() * 0.6)
+            role = "me" if is_right_aligned else "them"
+            entries.append({"role": role, "text": text, "y": rect.bottom})
+        except Exception:
+            continue
+
+    if not entries:
+        return []
+
+    entries.sort(key=lambda x: x["y"])
+    compact = []
+    for item in entries:
+        if compact and compact[-1]["role"] == item["role"] and compact[-1]["text"] == item["text"]:
+            continue
+        compact.append(item)
+
+    return compact[-limit:]
+
+
+def format_context_for_prompt(context_items):
+    if not context_items:
+        return ""
+    lines = []
+    for item in context_items[-CHAT_CONTEXT_LIMIT:]:
+        speaker = "我" if item["role"] == "me" else "对方"
+        lines.append(f"{speaker}: {item['text']}")
+    return "\n".join(lines)
+
+
 def build_session_dedup_key(session_info):
     return (
         session_info["name"],
@@ -357,23 +412,6 @@ def close_all_chrome_processes():
         print("  -> Closed running Chrome processes for clean profile startup.")
     except Exception as e:
         print(f"  -> Failed to close Chrome processes: {e}")
-
-
-def open_research_page_with_cdp(query_url: str):
-    print("  -> Trying browser-use via existing Chrome CDP...")
-    close_browser_use_session()
-    result = run_browser_use_command(
-        ["--cdp-url", CDP_URL, "--session", BROWSER_SESSION, "open", query_url],
-        timeout=60,
-        allow_failure=True,
-    )
-    if result["code"] == 0:
-        print("  -> Opened research page through existing Chrome CDP.")
-        return True
-
-    detail = result["stderr"] or result["stdout"] or "unknown open failure"
-    print(f"  -> browser-use cdp open failed: {detail}")
-    return False
 
 
 def open_research_page_with_profile(query_url: str):
@@ -532,17 +570,69 @@ def summarize_search_html(question: str, html_text: str, page_title: str | None 
     return f"{header}。摘要：{body}"
 
 
-def research_with_browser_use(question: str):
-    query_url = f"https://www.bing.com/search?q={quote_plus(question)}&setlang=zh-Hans"
+def request_chat_completion(system_prompt: str, user_prompt: str, temperature=0.3):
+    api_url = "https://vllm.codingstack.xyz:61721/v1/chat/completions"
+    api_key = "e6uIhWd+HVJSOYaN"
+    model = "gemma4"
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": temperature,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    response = requests.post(api_url, headers=headers, json=payload, timeout=180)
+    response.raise_for_status()
+    result = response.json()
+    return result["choices"][0]["message"]["content"].strip()
+
+
+def build_research_query(session_info, message_for_reply: str, context_items):
+    context_text = format_context_for_prompt(context_items)
+    system_prompt = (
+        "你是搜索查询改写助手。"
+        "请把微信最新消息改写成一条搜索 query，补全主语和背景实体。"
+        "只输出一行中文查询词，不要解释。"
+    )
+    user_prompt = (
+        f"会话名称：{session_info['name']}\n"
+        f"最新消息：{message_for_reply}\n"
+        f"最近上下文：\n{context_text or '无'}\n"
+        "输出最终检索 query。"
+    )
+    try:
+        query = request_chat_completion(system_prompt, user_prompt, temperature=0.1)
+        query = re.sub(r"\s+", " ", (query or "").strip().strip("。"))
+        if query:
+            return query
+    except Exception as e:
+        print(f"  -> Research query rewrite failed: {e}")
+
+    latest_them = ""
+    for item in reversed(context_items or []):
+        text = (item or {}).get("text", "")
+        if (item or {}).get("role") == "them" and text and text != message_for_reply:
+            latest_them = text
+            break
+    if latest_them and len(message_for_reply) <= 18:
+        return f"{latest_them} {message_for_reply}"
+    return message_for_reply
+
+
+def research_with_browser_use(question: str, search_query: str | None = None):
+    final_query = (search_query or question or "").strip()
+    query_url = f"https://www.bing.com/search?q={quote_plus(final_query)}&setlang=zh-Hans"
     try:
         print("  -> Realtime query detected, starting browser-use research flow...")
         cleanup_browser_use_runtime()
-
-        opened = open_research_page_with_cdp(query_url)
-        if not opened:
-            close_browser_use_session()
-            print(f"  -> Falling back to launching profile {BROWSER_PROFILE}...")
-            opened = open_research_page_with_profile(query_url)
+        close_browser_use_session()
+        print(f"  -> Opening browser-use directly with profile {BROWSER_PROFILE}...")
+        opened = open_research_page_with_profile(query_url)
 
         if not opened:
             close_browser_use_session()
@@ -551,22 +641,22 @@ def research_with_browser_use(question: str):
 
         if not opened:
             print("  -> browser-use unavailable, falling back to direct HTTP search summary.")
-            return research_via_http_search(question)
+            return research_via_http_search(final_query)
 
         time.sleep(2.0)
         page_title = get_browser_page_title()
         page_html = get_browser_page_html()
         if page_html:
-            summary = summarize_search_html(question, page_html, page_title)
+            summary = summarize_search_html(final_query, page_html, page_title)
             if summary:
                 return summary
 
         print("  -> browser-use opened page but could not extract summary. Falling back to HTTP search.")
-        return research_via_http_search(question)
+        return research_via_http_search(final_query)
     except Exception as e:
         print(f"  -> browser-use research failed: {e}")
         print("  -> Falling back to direct HTTP search summary.")
-        return research_via_http_search(question)
+        return research_via_http_search(final_query)
 
 
 def build_realtime_failure_reply(session_info, message_for_reply: str):
@@ -575,16 +665,23 @@ def build_realtime_failure_reply(session_info, message_for_reply: str):
     return "这个我得先查一下实时信息，等我确认清楚再跟你说。"
 
 
-def build_reply_prompt(session_info, message_for_reply: str, research_summary: str | None = None):
+def build_reply_prompt(
+    session_info,
+    message_for_reply: str,
+    research_summary: str | None = None,
+    context_items=None,
+):
     config = REPLY_TARGETS[session_info["name"]]
     chat_kind = "群聊" if session_info["is_group"] else "私聊"
     speaker = session_info["sender_name"] or session_info["name"]
+    context_text = format_context_for_prompt(context_items or [])
 
     system_prompt = (
         "你在代替真实用户回复微信消息。\n"
         "只输出一条可以直接发送的中文微信消息，不要解释，不要加引号，不要自称 AI。\n"
         "回复要像真人自然聊天，不要客服腔。\n"
         "默认控制在 1 到 3 句话，除非对方明显需要更完整说明。\n"
+        "要结合上下文连续对话，不要忽略上一轮问题。\n"
         "如果给了实时检索摘要，要优先依据该摘要作答，不要回避问题，不要只说自己没关注。\n"
         f"当前会话类型：{chat_kind}。\n"
         f"当前会话名称：{session_info['name']}。\n"
@@ -593,6 +690,7 @@ def build_reply_prompt(session_info, message_for_reply: str, research_summary: s
     )
 
     user_prompt = (
+        f"最近上下文：\n{context_text or '无'}\n"
         f"对方最新消息：{message_for_reply}\n"
         f"未读条数：{session_info['unread_count']}\n"
         f"消息时间：{session_info['time'] or '未知'}\n"
@@ -604,33 +702,22 @@ def build_reply_prompt(session_info, message_for_reply: str, research_summary: s
     return system_prompt, user_prompt
 
 
-def get_llm_reply(session_info, message_for_reply: str, research_summary: str | None = None):
+def get_llm_reply(
+    session_info,
+    message_for_reply: str,
+    research_summary: str | None = None,
+    context_items=None,
+):
     print(f"Generating LLM reply for: {message_for_reply}")
-
-    api_url = "https://vllm.codingstack.xyz:61721/v1/chat/completions"
-    api_key = "e6uIhWd+HVJSOYaN"
-    model = "gemma4"
-    system_prompt, user_prompt = build_reply_prompt(session_info, message_for_reply, research_summary)
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.5,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
+    system_prompt, user_prompt = build_reply_prompt(
+        session_info,
+        message_for_reply,
+        research_summary,
+        context_items=context_items or [],
+    )
 
     try:
-        response = requests.post(api_url, headers=headers, json=payload, timeout=300)
-        response.raise_for_status()
-        result = response.json()
-        return result["choices"][0]["message"]["content"].strip()
+        return request_chat_completion(system_prompt, user_prompt, temperature=0.5)
     except Exception as e:
         print(f"API Error: {e}")
         return None
@@ -701,17 +788,28 @@ def monitor_all_unread():
                         processed_previews.add(preview_key)
                         continue
 
+                    context_items = get_recent_chat_context(main_window, limit=CHAT_CONTEXT_LIMIT)
+                    if context_items:
+                        print(f"  -> Context loaded: {len(context_items)} recent turns.")
+
                     reply = None
                     if needs_realtime_lookup(message_for_reply):
-                        research_summary = research_with_browser_use(message_for_reply)
+                        search_query = build_research_query(session_info, message_for_reply, context_items)
+                        print(f"  -> Research query: {search_query}")
+                        research_summary = research_with_browser_use(message_for_reply, search_query=search_query)
                         if research_summary:
                             print(f"  -> Research Summary: {research_summary}")
-                            reply = get_llm_reply(session_info, message_for_reply, research_summary)
+                            reply = get_llm_reply(
+                                session_info,
+                                message_for_reply,
+                                research_summary,
+                                context_items=context_items,
+                            )
                         else:
                             reply = build_realtime_failure_reply(session_info, message_for_reply)
                             print(f"  -> Research unavailable, sending cautious fallback: {reply}")
                     else:
-                        reply = get_llm_reply(session_info, message_for_reply)
+                        reply = get_llm_reply(session_info, message_for_reply, context_items=context_items)
 
                     if reply:
                         print(f"  -> Sending Reply: {reply}")
