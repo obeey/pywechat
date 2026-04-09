@@ -55,7 +55,7 @@ Have fun in WechatAutomation (＾＿－)
 ====
 '''
 import sys
-from.WeChatAuto import AutoReply,Call,Contacts,Files,FriendSettings,GroupSettings,Messages,Monitor,Moments,Settings
+from.WechatAuto import AutoReply,Call,Contacts,Files,FriendSettings,GroupSettings,Messages,Monitor,Moments,Settings
 from.WeChatTools import Tools,Navigator
 from.Errors import NotInstalledError
 if sys.maxsize==2**63-1:#64位操作系统

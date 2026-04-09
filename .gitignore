@@ -2,3 +2,7 @@ __pycache__/
 *.pyc 
 *.venv
 venv/
+backup_cleanup/
+*.log
+*.txt
+*.md
